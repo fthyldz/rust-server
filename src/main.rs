@@ -1,18 +1,19 @@
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
+use webrtc::api::media_engine::MediaEngine;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp::packet::Packet;
 //use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
 //use webrtc::rtp_transceiver::RTCRtpTransceiver;
 //use webrtc::track::track_remote::TrackRemote;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
-use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ChatMessage {
@@ -93,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Yeni bağlantıları kabul et
     while let Ok((stream, addr)) = listener.accept().await {
         println!("Yeni bağlantı: {}", addr);
-        
+
         let clients = clients.clone();
         tokio::spawn(handle_connection(stream, addr, clients));
     }
@@ -134,41 +135,50 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
     });
 
     // WebRTC Peer Connection oluşturma
-    let peer_connection = match create_peer_connection().await {
+    let peer_connection: RTCPeerConnection = match create_peer_connection().await {
         Ok(pc) => pc,
         Err(e) => {
             println!("Peer bağlantısı oluşturulamadı: {}", e);
             return;
         }
     };
-    let peer_connection = Arc::new(Mutex::new(peer_connection));
+    let peer_connection_arc = Arc::new(RwLock::new(peer_connection));
 
-    let peer_connection_clone = Arc::clone(&peer_connection);
+    let peer_connection_clone = Arc::clone(&peer_connection_arc);
     tokio::spawn(async move {
-        let pc = peer_connection_clone.lock().await;
-        pc.on_track(Box::new(move |track, _, _| {
+        println!(" {} adresine PeerConnection oluşturuldu", addr);
+        println!("Track id: {} Kind: {}", track.id(), track.kind());
+        peer_connection_clone.read().await.on_track(Box::new(move |track, _, _| {
             println!("Track id: {}", track.id());
             let track_clone = track.clone();
             tokio::spawn(async move {
-                while let Ok((rtp_packet, _)) = track_clone.read_rtp().await {
-                    // RTP paketini işleyin
-                    println!("RTP Paketi Alındı");
-                    handle_rtp_packet(&rtp_packet);
+                loop {
+                    match track_clone.read_rtp().await {
+                        Ok((rtp_packet, _)) => {
+                            // RTP paketini işleyin
+                            println!("RTP Paketi Alındı");
+                            handle_rtp_packet(&rtp_packet);
+                        }
+                        Err(e) => {
+                            // Hata durumu loglanıyor
+                            eprintln!("RTP Okuma Hatası: {:?}", e);
+                            break; // Hata durumunda döngüyü sonlandırıyoruz
+                        }
+                    }
                 }
             });
-    
+
             Box::pin(async move {})
         }));
     });
 
     let clients_clone = Arc::clone(&clients);
-    let peer_connection_clone = Arc::clone(&peer_connection);
+    let peer_connection_clone = Arc::clone(&peer_connection_arc);
     tokio::spawn(async move {
         let clients_clone = clients_clone.clone();
-        let pc = peer_connection_clone.lock().await;
-        pc.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        peer_connection_clone.read().await.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
             let clients_clone = clients_clone.clone();
-            tokio::spawn(async move {    
+            tokio::spawn(async move {
                 if let Some(candidate) = candidate {
                     let clients_lock = clients_clone.lock().await;
                     let client_tx = clients_lock.get(&addr).unwrap();
@@ -179,14 +189,15 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                         sdp_mline_index: candidate.to_json().unwrap().sdp_mline_index,
                         username_fragment: candidate.to_json().unwrap().username_fragment,
                     };
-                    client_tx.unbounded_send(Message::Text(serde_json::to_string(&candidate).unwrap())).unwrap();
+                    client_tx
+                        .unbounded_send(Message::Text(serde_json::to_string(&candidate).unwrap()))
+                        .unwrap();
                 }
             });
 
             Box::pin(async move {})
         }));
     });
-    
 
     // İstemciden gelen mesajları dinle
     let ws_sender_clone = Arc::clone(&ws_sender);
@@ -194,68 +205,122 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
         match result {
             Ok(msg) => {
                 //println!("{} adresinden mesaj alındı: {:?}", addr, msg);
-                
+
                 match msg {
                     Message::Text(text) => {
                         // Mesajı serde_json::Value olarak ayrıştır
                         match serde_json::from_str::<Value>(&text) {
                             Ok(value) => {
                                 // Mesajın msg_type alanına bak
-                                if let Some(msg_type) = value.get("msg_type").and_then(|v| v.as_str()) {
+                                if let Some(msg_type) =
+                                    value.get("msg_type").and_then(|v| v.as_str())
+                                {
                                     match msg_type {
                                         "ping" => {
                                             println!("{} adresinden ping alındı", addr);
                                             let mut ws_sender = ws_sender_clone.lock().await;
-                                            if let Err(e) = ws_sender.send(Message::Text(String::from("{ 'msg_type': 'pong', 'content': [] }"))).await {
+                                            if let Err(e) = ws_sender
+                                                .send(Message::Text(String::from(
+                                                    "{ 'msg_type': 'pong', 'content': [] }",
+                                                )))
+                                                .await
+                                            {
                                                 println!("Pong gönderme hatası: {}", e);
                                                 break;
                                             }
                                         }
                                         "chat" => {
                                             // Chat mesajı olarak işleyin
-                                            if let Ok(chat_msg) = serde_json::from_value::<ChatMessage>(value.clone()) {
-                                                println!("İstemciden alınan chat mesajı: {:?}", chat_msg);
+                                            if let Ok(chat_msg) =
+                                                serde_json::from_value::<ChatMessage>(value.clone())
+                                            {
+                                                println!(
+                                                    "İstemciden alınan chat mesajı: {:?}",
+                                                    chat_msg
+                                                );
 
                                                 // Mesajı diğer istemcilere gönder
                                                 let clients_lock = clients.lock().await;
-                                                for (client_addr, client_tx) in clients_lock.iter() {
+                                                for (client_addr, client_tx) in clients_lock.iter()
+                                                {
                                                     if *client_addr != addr {
-                                                        let json_msg = serde_json::to_string(&chat_msg).unwrap();
-                                                        if let Err(e) = client_tx.unbounded_send(Message::Text(json_msg)) {
-                                                            println!("Broadcast hatası {}: {}", client_addr, e);
+                                                        let json_msg =
+                                                            serde_json::to_string(&chat_msg)
+                                                                .unwrap();
+                                                        if let Err(e) = client_tx
+                                                            .unbounded_send(Message::Text(json_msg))
+                                                        {
+                                                            println!(
+                                                                "Broadcast hatası {}: {}",
+                                                                client_addr, e
+                                                            );
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                         "offer" => {
-                                            if let Ok(message) = serde_json::from_value::<OfferSignalMessage>(value.clone()){
+                                            if let Ok(message) =
+                                                serde_json::from_value::<OfferSignalMessage>(
+                                                    value.clone(),
+                                                )
+                                            {
+                                                let peer_connection_clone = Arc::clone(&peer_connection_arc);
                                                 let remote_sdp_string = message.content;
-                                                let pc = peer_connection.lock().await;
-                                                let remote_sdp: RTCSessionDescription = RTCSessionDescription::offer(remote_sdp_string).unwrap();
-                                                if Ok(()) == pc.set_remote_description(remote_sdp).await {
+                                                let pc = peer_connection_clone.write().await;
+                                                let remote_sdp: RTCSessionDescription =
+                                                    RTCSessionDescription::offer(remote_sdp_string)
+                                                        .unwrap();
+                                                if Ok(())
+                                                    == pc.set_remote_description(remote_sdp).await
+                                                {
                                                     println!("set_remote_description");
-                                                    if let Ok(local_sdp) = pc.create_answer(Some(Default::default())).await {
+                                                    if let Ok(local_sdp) = pc
+                                                        .create_answer(Some(Default::default()))
+                                                        .await
+                                                    {
                                                         println!("create_answer");
-                                                        if Ok(()) == pc.set_local_description(local_sdp.clone()).await {
+                                                        if Ok(())
+                                                            == pc
+                                                                .set_local_description(
+                                                                    local_sdp.clone(),
+                                                                )
+                                                                .await
+                                                        {
                                                             println!("set_local_description");
                                                             let clients_lock = clients.lock().await;
-                                                            if let Some(client_tx) = clients_lock.get(&addr) {
+                                                            if let Some(client_tx) =
+                                                                clients_lock.get(&addr)
+                                                            {
                                                                 println!("unbounded_send");
-                                                                let local_sdp_answer = AnswerSignalMessage
-                                                                {
-                                                                    msg_type: "answer".to_string(),
-                                                                    content: local_sdp.sdp
-                                                                };
-                                                                client_tx.unbounded_send(Message::Text(serde_json::to_string(&local_sdp_answer).expect("SDP oluşturulamadı"))).expect("SDP gönderilemedi");
+                                                                let local_sdp_answer =
+                                                                    AnswerSignalMessage {
+                                                                        msg_type: "answer"
+                                                                            .to_string(),
+                                                                        content: local_sdp.sdp,
+                                                                    };
+                                                                client_tx
+                                                                    .unbounded_send(Message::Text(
+                                                                        serde_json::to_string(
+                                                                            &local_sdp_answer,
+                                                                        )
+                                                                        .expect(
+                                                                            "SDP oluşturulamadı",
+                                                                        ),
+                                                                    ))
+                                                                    .expect("SDP gönderilemedi");
                                                             } else {
                                                                 println!("İstemci bulunamadı");
                                                             }
                                                         } else {
-                                                            println!("Local description ayarlanamadı");
+                                                            println!(
+                                                                "Local description ayarlanamadı"
+                                                            );
                                                         }
                                                     } else {
-                                                        println!("Local description oluşturulamadı");
+                                                        println!(
+                                                            "Local description oluşturulamadı"
+                                                        );
                                                     }
                                                 } else {
                                                     println!("Remote description ayarlanamadı");
@@ -265,10 +330,20 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                                             }
                                         }
                                         "candidate" => {
-                                            if let Ok(message) = serde_json::from_value::<IceCandidateSignalMessage>(value.clone()) {
-                                                let candidatee = RTCIceCandidateInit { candidate: message.content.clone(), sdp_mid: message.sdp_mid.clone(), sdp_mline_index: message.sdp_mline_index, username_fragment: message.username_fragment };
-                                                let pc = peer_connection.lock().await;
-                                                if Ok(()) == pc.add_ice_candidate(candidatee).await {
+                                            if let Ok(message) =
+                                                serde_json::from_value::<IceCandidateSignalMessage>(
+                                                    value.clone(),
+                                                )
+                                            {
+                                                let candidatee = RTCIceCandidateInit {
+                                                    candidate: message.content.clone(),
+                                                    sdp_mid: message.sdp_mid.clone(),
+                                                    sdp_mline_index: message.sdp_mline_index,
+                                                    username_fragment: message.username_fragment,
+                                                };
+                                                let peer_connection_clone = Arc::clone(&peer_connection_arc);
+                                                if Ok(()) == peer_connection_clone.write().await.add_ice_candidate(candidatee).await
+                                                {
                                                     println!("ICE adayı eklendi");
                                                 } else {
                                                     println!("ICE adayı eklenemedi");
@@ -292,6 +367,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                     }
                     Message::Close(_) => {
                         println!("{} bağlantıyı kapatıyor", addr);
+                        let peer_connection_clone = Arc::clone(&peer_connection_arc);
+                        peer_connection_clone.read().await.close().await.unwrap();
                         break;
                     }
                     _ => {}
@@ -311,12 +388,13 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
 }
 
 use webrtc::api::APIBuilder;
+use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 //use webrtc::data_channel::data_channel_message::DataChannelMessage;
 
-async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/) -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
+async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
+) -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
     //let config = RTCConfiguration::default();
 
     let mut config = RTCConfiguration::default();
@@ -325,8 +403,9 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/) -> Resul
         ..Default::default()
     });
 
-    let api = APIBuilder::new().build();
-    
+    let media_engine = MediaEngine::default();
+    let api = APIBuilder::new().with_media_engine(media_engine).build();
+
     // PeerConnection oluştur
     let peer_connection = api.new_peer_connection(config).await.unwrap();
 
@@ -339,14 +418,13 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/) -> Resul
             println!("DataChannel mesajı alındı: {:?}", msg);
         })
     }));*/
-    
 
     /*peer_connection.on_track(Box::new(move |track: Arc<TrackRemote>, receiver: Arc<RTCRtpReceiver>, _: Arc<RTCRtpTransceiver>| {
         // Tüm closure'ı 'static hale getirmek için move anahtar kelimesi kullanılıyor.
         Box::pin(async move {
             // Track ve Receiver'dan gerekli bilgileri alabilirsiniz
             println!("Track id: {}, Receiver id: {}", track.id(), receiver.tracks().await[0].id());
-    
+
             // RTP paketlerini okuyun
             while let Ok((rtp_packet, _)) = track.read_rtp().await {
                 // RTP paketini işleyin
