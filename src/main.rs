@@ -1,19 +1,17 @@
 use futures::{SinkExt, StreamExt};
-use serde_json::Value;
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::peer_connection::RTCPeerConnection;
-use webrtc::rtp::packet::Packet;
-//use webrtc::rtp_transceiver::rtp_receiver::RTCRtpReceiver;
-//use webrtc::rtp_transceiver::RTCRtpTransceiver;
-//use webrtc::track::track_remote::TrackRemote;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
+use webrtc::api::media_engine::MediaEngine;
+use webrtc::ice_transport::ice_server::RTCIceServer;
+use webrtc::peer_connection::offer_answer_options::RTCAnswerOptions;
+use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp::packet::Packet;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ChatMessage {
@@ -78,31 +76,34 @@ struct IceCandidateMessage {
     content: String,
 }
 
-type Clients = Arc<Mutex<HashMap<SocketAddr, futures::channel::mpsc::UnboundedSender<Message>>>>;
+type Clients = Arc<RwLock<HashMap<SocketAddr, futures::channel::mpsc::UnboundedSender<Message>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sunucuyu localhost:8080'de başlat
     //let addr = "0.0.0.0:8080";
-    let addr = "0.0.0.0:8080";
+    let addr = "localhost:8080";
     let listener = TcpListener::bind(&addr).await?;
     println!("WebSocket sunucusu şurada çalışıyor: {}", addr);
 
     // Bağlı istemcilerin listesini tut
-    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+    let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
 
     // Yeni bağlantıları kabul et
     while let Ok((stream, addr)) = listener.accept().await {
         println!("Yeni bağlantı: {}", addr);
 
-        let clients = clients.clone();
-        tokio::spawn(handle_connection(stream, addr, clients));
+        tokio::spawn(handle_connection(stream, addr, clients.clone()));
     }
 
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients) {
+async fn handle_connection(
+    stream: TcpStream,
+    addr: SocketAddr,
+    clients: Arc<RwLock<HashMap<SocketAddr, futures::channel::mpsc::UnboundedSender<Message>>>>,
+) {
     // TCP stream'i WebSocket'e yükselt
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
@@ -119,7 +120,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
 
     // Broadcast kanalı oluştur
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
-    clients.lock().await.insert(addr, tx);
+    clients.write().await.insert(addr, tx);
 
     // Broadcast mesajlarını dinle ve gönder
     let ws_sender_clone = Arc::clone(&ws_sender);
@@ -142,62 +143,63 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
             return;
         }
     };
-    let peer_connection_arc = Arc::new(RwLock::new(peer_connection));
 
-    let peer_connection_clone = Arc::clone(&peer_connection_arc);
-    tokio::spawn(async move {
-        println!(" {} adresine PeerConnection oluşturuldu", addr);
-        println!("Track id: {} Kind: {}", track.id(), track.kind());
-        peer_connection_clone.read().await.on_track(Box::new(move |track, _, _| {
+    peer_connection.on_track(Box::new(move |track, _, _| {
+        Box::pin(async move {
             println!("Track id: {}", track.id());
             let track_clone = track.clone();
-            tokio::spawn(async move {
-                loop {
-                    match track_clone.read_rtp().await {
-                        Ok((rtp_packet, _)) => {
-                            // RTP paketini işleyin
-                            println!("RTP Paketi Alındı");
-                            handle_rtp_packet(&rtp_packet);
-                        }
-                        Err(e) => {
-                            // Hata durumu loglanıyor
-                            eprintln!("RTP Okuma Hatası: {:?}", e);
-                            break; // Hata durumunda döngüyü sonlandırıyoruz
-                        }
+            loop {
+                match track_clone.read_rtp().await {
+                    Ok((rtp_packet, _)) => {
+                        // RTP paketini işleyin
+                        println!("RTP Paketi Alındı");
+                        handle_rtp_packet(&rtp_packet);
+                    }
+                    Err(e) => {
+                        // Hata durumu loglanıyor
+                        eprintln!("RTP Okuma Hatası: {:?}", e);
+                        break; // Hata durumunda döngüyü sonlandırıyoruz
                     }
                 }
-            });
+            }
+        })
+    }));
 
-            Box::pin(async move {})
-        }));
-    });
+    let clients_arc = Arc::clone(&clients);
+    peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        let clients = clients_arc.clone();
+        Box::pin(async move {
+            if let Some(candidate) = candidate {
+                let candidate = IceCandidateSignalMessage {
+                    msg_type: "candidate".to_string(),
+                    content: candidate.to_json().unwrap().candidate,
+                    sdp_mid: candidate.to_json().unwrap().sdp_mid,
+                    sdp_mline_index: candidate.to_json().unwrap().sdp_mline_index,
+                    username_fragment: candidate.to_json().unwrap().username_fragment,
+                };
+                
+                let clients = clients.read().await;
+                let client_tx = clients.get(&addr).unwrap();
+                client_tx
+                    .unbounded_send(Message::Text(serde_json::to_string(&candidate).unwrap()))
+                    .unwrap();
+            }
+        })
+    }));
 
-    let clients_clone = Arc::clone(&clients);
-    let peer_connection_clone = Arc::clone(&peer_connection_arc);
-    tokio::spawn(async move {
-        let clients_clone = clients_clone.clone();
-        peer_connection_clone.read().await.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
-            let clients_clone = clients_clone.clone();
-            tokio::spawn(async move {
-                if let Some(candidate) = candidate {
-                    let clients_lock = clients_clone.lock().await;
-                    let client_tx = clients_lock.get(&addr).unwrap();
-                    let candidate = IceCandidateSignalMessage {
-                        msg_type: "candidate".to_string(),
-                        content: candidate.to_json().unwrap().candidate,
-                        sdp_mid: candidate.to_json().unwrap().sdp_mid,
-                        sdp_mline_index: candidate.to_json().unwrap().sdp_mline_index,
-                        username_fragment: candidate.to_json().unwrap().username_fragment,
-                    };
-                    client_tx
-                        .unbounded_send(Message::Text(serde_json::to_string(&candidate).unwrap()))
-                        .unwrap();
-                }
-            });
+    peer_connection.on_ice_connection_state_change(Box::new(move |ice_connection_state| {
+        Box::pin(async move {
+            println!("ICE Connection State: {:?}", ice_connection_state);
+        })
+    }));
 
-            Box::pin(async move {})
-        }));
-    });
+    peer_connection.on_ice_gathering_state_change(Box::new(move |ice_gatherer_state| {
+        Box::pin(async move {
+            println!("ICE Gatherer State: {:?}", ice_gatherer_state);
+        })
+    }));
+
+    let peer_connection_arc = Arc::new(RwLock::new(peer_connection));
 
     // İstemciden gelen mesajları dinle
     let ws_sender_clone = Arc::clone(&ws_sender);
@@ -240,8 +242,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                                                 );
 
                                                 // Mesajı diğer istemcilere gönder
-                                                let clients_lock = clients.lock().await;
-                                                for (client_addr, client_tx) in clients_lock.iter()
+                                                for (client_addr, client_tx) in
+                                                    clients.read().await.iter()
                                                 {
                                                     if *client_addr != addr {
                                                         let json_msg =
@@ -265,9 +267,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                                                     value.clone(),
                                                 )
                                             {
-                                                let peer_connection_clone = Arc::clone(&peer_connection_arc);
                                                 let remote_sdp_string = message.content;
-                                                let pc = peer_connection_clone.write().await;
+                                                let pc = peer_connection_arc.write().await;
                                                 let remote_sdp: RTCSessionDescription =
                                                     RTCSessionDescription::offer(remote_sdp_string)
                                                         .unwrap();
@@ -276,7 +277,9 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                                                 {
                                                     println!("set_remote_description");
                                                     if let Ok(local_sdp) = pc
-                                                        .create_answer(Some(Default::default()))
+                                                        .create_answer(Some(RTCAnswerOptions {
+                                                            ..Default::default()
+                                                        }))
                                                         .await
                                                     {
                                                         println!("create_answer");
@@ -288,9 +291,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                                                                 .await
                                                         {
                                                             println!("set_local_description");
-                                                            let clients_lock = clients.lock().await;
                                                             if let Some(client_tx) =
-                                                                clients_lock.get(&addr)
+                                                                clients.read().await.get(&addr)
                                                             {
                                                                 println!("unbounded_send");
                                                                 let local_sdp_answer =
@@ -341,8 +343,12 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                                                     sdp_mline_index: message.sdp_mline_index,
                                                     username_fragment: message.username_fragment,
                                                 };
-                                                let peer_connection_clone = Arc::clone(&peer_connection_arc);
-                                                if Ok(()) == peer_connection_clone.write().await.add_ice_candidate(candidatee).await
+                                                if Ok(())
+                                                    == peer_connection_arc
+                                                        .write()
+                                                        .await
+                                                        .add_ice_candidate(candidatee)
+                                                        .await
                                                 {
                                                     println!("ICE adayı eklendi");
                                                 } else {
@@ -367,8 +373,7 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
                     }
                     Message::Close(_) => {
                         println!("{} bağlantıyı kapatıyor", addr);
-                        let peer_connection_clone = Arc::clone(&peer_connection_arc);
-                        peer_connection_clone.read().await.close().await.unwrap();
+                        peer_connection_arc.read().await.close().await.unwrap();
                         break;
                     }
                     _ => {}
@@ -383,7 +388,8 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients
 
     // Bağlantı koptuğunda temizlik yap
     println!("{} bağlantısı koptu", addr);
-    clients.lock().await.remove(&addr);
+    clients.write().await.remove(&addr);
+    peer_connection_arc.write().await.close().await.unwrap();
     broadcast_task.abort();
 }
 
@@ -397,17 +403,46 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
 ) -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
     //let config = RTCConfiguration::default();
 
-    let mut config = RTCConfiguration::default();
-    config.ice_servers.push(RTCIceServer {
-        urls: vec![String::from("stun:stun.l.google.com:19302")],
+    let stun_server_1 = RTCIceServer {
+        urls: vec!["stun:stun.l.google.com:19302".to_string()],
         ..Default::default()
-    });
+    };
 
-    let media_engine = MediaEngine::default();
+    let config = RTCConfiguration {
+        ice_servers: vec![stun_server_1],
+        ..Default::default()
+    };
+
+    let mut media_engine = MediaEngine::default();
+
+    media_engine.register_default_codecs()?;
+
     let api = APIBuilder::new().with_media_engine(media_engine).build();
 
     // PeerConnection oluştur
     let peer_connection = api.new_peer_connection(config).await.unwrap();
+
+    // Add audio transceiver
+    /*peer_connection
+        .add_transceiver_from_kind(
+            RTPCodecType::Audio,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                send_encodings: vec![]
+            }),
+        )
+        .await?;
+
+    // Add video transceiver
+    peer_connection
+        .add_transceiver_from_kind(
+            RTPCodecType::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                send_encodings: vec![],
+            }),
+        )
+        .await?;*/
 
     // Data Channel oluştur
     //let data_channel = peer_connection.create_data_channel("chat", None).await?;
