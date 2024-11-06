@@ -82,7 +82,7 @@ type Clients = Arc<RwLock<HashMap<SocketAddr, futures::channel::mpsc::UnboundedS
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Sunucuyu localhost:8080'de başlat
     //let addr = "0.0.0.0:8080";
-    let addr = "localhost:8080";
+    let addr = "0.0.0.0:8080";
     let listener = TcpListener::bind(&addr).await?;
     println!("WebSocket sunucusu şurada çalışıyor: {}", addr);
 
