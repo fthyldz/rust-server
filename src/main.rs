@@ -393,8 +393,10 @@ async fn handle_connection(
     broadcast_task.abort();
 }
 
+use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 //use webrtc::data_channel::data_channel_message::DataChannelMessage;
