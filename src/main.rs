@@ -408,8 +408,13 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
         ..Default::default()
     };
 
+    let stun_server_2 = RTCIceServer {
+        urls: vec!["stun:stun2.l.google.com:19302".to_string()],
+        ..Default::default()
+    };
+
     let config = RTCConfiguration {
-        ice_servers: vec![stun_server_1],
+        ice_servers: vec![stun_server_1, stun_server_2],
         ..Default::default()
     };
 
