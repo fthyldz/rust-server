@@ -403,29 +403,28 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
 ) -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
     //let config = RTCConfiguration::default();
 
+    let mut media_engine = MediaEngine::default();
+
+    media_engine.register_default_codecs()?;
+
+    let mut registry = Registry::new();
+
+    registry = register_default_interceptors(registry, &mut media_engine)?;
+    
+    let api = APIBuilder::new().with_media_engine(media_engine).with_interceptor_registry(registry).build();
+
     let stun_server_1 = RTCIceServer {
         urls: vec!["stun:stun.l.google.com:19302".to_string()],
         ..Default::default()
     };
 
-    let stun_server_2 = RTCIceServer {
-        urls: vec!["stun:stun2.l.google.com:19302".to_string()],
-        ..Default::default()
-    };
-
     let config = RTCConfiguration {
-        ice_servers: vec![stun_server_1, stun_server_2],
+        ice_servers: vec![stun_server_1],
         ..Default::default()
     };
-
-    let mut media_engine = MediaEngine::default();
-
-    media_engine.register_default_codecs()?;
-
-    let api = APIBuilder::new().with_media_engine(media_engine).build();
 
     // PeerConnection oluştur
-    let peer_connection = api.new_peer_connection(config).await.unwrap();
+    let peer_connection = api.new_peer_connection(config).await?;
 
     // Add audio transceiver
     /*peer_connection
