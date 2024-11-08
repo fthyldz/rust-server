@@ -393,8 +393,10 @@ async fn handle_connection(
     broadcast_task.abort();
 }
 
+use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 //use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -402,6 +404,16 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
 ) -> Result<RTCPeerConnection, Box<dyn std::error::Error>> {
     //let config = RTCConfiguration::default();
+
+    let mut media_engine = MediaEngine::default();
+
+    media_engine.register_default_codecs()?;
+
+    let mut registry = Registry::new();
+
+    registry = register_default_interceptors(registry, &mut media_engine)?;
+    
+    let api = APIBuilder::new().with_media_engine(media_engine).with_interceptor_registry(registry).build();
 
     let stun_server_1 = RTCIceServer {
         urls: vec!["stun:stun.l.google.com:19302".to_string()],
@@ -414,14 +426,8 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
         ..Default::default()
     };
 
-    let mut media_engine = MediaEngine::default();
-
-    media_engine.register_default_codecs()?;
-
-    let api = APIBuilder::new().with_media_engine(media_engine).build();
-
     // PeerConnection oluştur
-    let peer_connection = api.new_peer_connection(config).await.unwrap();
+    let peer_connection = api.new_peer_connection(config).await?;
 
     // Add audio transceiver
     /*peer_connection
