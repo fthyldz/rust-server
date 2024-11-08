@@ -420,8 +420,13 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
         ..Default::default()
     };
 
+    let stun_server_2 = RTCIceServer {
+        urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
+        ..Default::default()
+    };
+
     let config = RTCConfiguration {
-        ice_servers: vec![stun_server_1],
+        ice_servers: vec![stun_server_1, stun_server_2],
         ice_transport_policy: webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy::All,
         ..Default::default()
     };
