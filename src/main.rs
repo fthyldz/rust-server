@@ -410,6 +410,7 @@ async fn create_peer_connection(/*clients: Clients, addr: SocketAddr*/
 
     let config = RTCConfiguration {
         ice_servers: vec![stun_server_1],
+        ice_transport_policy: "all".to_string(),
         ..Default::default()
     };
 
